@@ -6,6 +6,7 @@
  * in CircleCI.
  */
 
+import type { AssistantMessage } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { spawn, type ChildProcess } from "node:child_process";
 import { access } from "node:fs/promises";
@@ -176,50 +177,39 @@ export default function (pi: ExtensionAPI) {
     errorMessage = message;
   }
 
-  // Build CCI status line for footer - with newline to separate from token info
+  // Build CCI status line
   function buildCciStatus(): string {
     const branch = currentBranch || "unknown";
-    let status: string;
 
     switch (extensionState) {
       case "not_installed":
-        status = `⚙️ CCI: ${branch} | ⛔ cci CLI not found`;
-        break;
+        return `⚙️ CCI: ${branch} | ⛔ cci CLI not found`;
       case "not_circleci":
-        status = `⚙️ CCI: ${branch} | ○ Not a CircleCI repo`;
-        break;
+        return `⚙️ CCI: ${branch} | ○ Not a CircleCI repo`;
       case "no_remote":
-        status = `⚙️ CCI: ${branch} | ○ No git remote`;
-        break;
+        return `⚙️ CCI: ${branch} | ○ No git remote`;
       case "error":
-        status = `⚙️ CCI: ${branch} | ⛔ ${errorMessage}`;
-        break;
+        return `⚙️ CCI: ${branch} | ⛔ ${errorMessage}`;
       case "checking":
       case "idle":
-        status = `⚙️ CCI: ${branch} | ◌ Checking`;
-        break;
+        return `⚙️ CCI: ${branch} | ◌ Checking`;
       case "subscribed":
         if (workflows.size === 0) {
-          status = `⚙️ CCI: ${branch} | idle`;
-        } else {
-          const parts: string[] = [];
-          for (const wf of workflows.values()) {
-            const icon = STATUS_ICONS[wf.status] || "?";
-            if (wf.status === "running") {
-              parts.push(`${icon} ${wf.name} (${formatDuration(wf.startedAt)})`);
-            } else {
-              parts.push(`${icon} ${wf.name}`);
-            }
-          }
-          status = `⚙️ CCI: ${branch} | ${parts.join(" | ")}`;
+          return `⚙️ CCI: ${branch} | idle`;
         }
-        break;
+        const parts: string[] = [];
+        for (const wf of workflows.values()) {
+          const icon = STATUS_ICONS[wf.status] || "?";
+          if (wf.status === "running") {
+            parts.push(`${icon} ${wf.name} (${formatDuration(wf.startedAt)})`);
+          } else {
+            parts.push(`${icon} ${wf.name}`);
+          }
+        }
+        return `⚙️ CCI: ${branch} | ${parts.join(" | ")}`;
       default:
-        status = `⚙️ CCI: ${branch}`;
+        return `⚙️ CCI: ${branch}`;
     }
-
-    // Add newline to push token info to next line
-    return status + "\n";
   }
 
   // Start cci subscribe process
@@ -417,6 +407,7 @@ export default function (pi: ExtensionAPI) {
   let lastCheckedBranch: string | null = null;
   let branchCheckInterval: ReturnType<typeof setInterval> | null = null;
   let currentCtx: { cwd: string; ui: ExtensionAPI["ui"] } | null = null;
+  let tuiRef: { requestRender: () => void } | null = null;
 
   async function checkBranchChange(): Promise<void> {
     if (!currentCtx) return;
@@ -445,13 +436,50 @@ export default function (pi: ExtensionAPI) {
 
     await startSubscription(ctx.cwd);
 
-    // Use setStatus with newline to push token info to next line
-    ctx.ui.setStatus("cci", buildCciStatus());
+    // Set up custom footer with CCI status and token stats
+    ctx.ui.setFooter((tui, theme) => {
+      tuiRef = tui;
+
+      return {
+        dispose() {
+          tuiRef = null;
+        },
+        invalidate() {},
+        render(width: number): string[] {
+          // Calculate token stats from session (same as default footer)
+          let input = 0, output = 0, cost = 0;
+          for (const e of ctx.sessionManager.getBranch()) {
+            if (e.type === "message" && e.message.role === "assistant") {
+              const m = e.message as AssistantMessage;
+              input += m.usage.input;
+              output += m.usage.output;
+              cost += m.usage.cost.total;
+            }
+          }
+
+          const fmt = (n: number) => n < 1000 ? `${n}` : n < 10000 ? `${(n/1000).toFixed(1)}k` : `${Math.round(n/1000)}k`;
+          const costFmt = (n: number) => n < 1 ? `$${n.toFixed(3)}` : `$${n.toFixed(2)}`;
+
+          // Build lines - CCI status first, then token stats
+          const cciLine = theme.fg("dim", buildCciStatus());
+
+          // Token stats line
+          const modelId = ctx.model?.id || "no-model";
+          let statsParts = [];
+          if (input) statsParts.push(`↑${fmt(input)}`);
+          if (output) statsParts.push(`↓${fmt(output)}`);
+          if (cost > 0) statsParts.push(costFmt(cost));
+          const statsLine = theme.fg("dim", `${statsParts.join(" ")} ${modelId}`);
+
+          return [cciLine, statsLine];
+        },
+      };
+    });
 
     // Start polling for branch changes
     branchCheckInterval = setInterval(async () => {
       await checkBranchChange();
-      ctx.ui.setStatus("cci", buildCciStatus());
+      tuiRef?.requestRender();
     }, 5000);
   });
 
@@ -462,7 +490,6 @@ export default function (pi: ExtensionAPI) {
       branchCheckInterval = null;
     }
     stopSubscription();
-    currentCtx?.ui.setStatus("cci", undefined);
     currentCtx = null;
   });
 
@@ -471,7 +498,7 @@ export default function (pi: ExtensionAPI) {
     description: "Restart CircleCI subscription for current branch",
     handler: async (_args, ctx) => {
       await startSubscription(ctx.cwd);
-      ctx.ui.setStatus("cci", buildCciStatus());
+      tuiRef?.requestRender();
     },
   });
 
@@ -479,8 +506,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("cci-status", {
     description: "Show CircleCI workflow status",
     handler: async (_args, ctx) => {
-      const status = buildCciStatus().trim();
-      ctx.ui.notify(status, "info");
+      ctx.ui.notify(buildCciStatus(), "info");
     },
   });
 }
