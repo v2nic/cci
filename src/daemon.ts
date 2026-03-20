@@ -10,11 +10,16 @@ export type DaemonState = {
   subscriptionsBySocket: Map<string, Set<string>>;
   socketTargets: Map<string, SubscriptionTarget[]>;
   lastStateByPipeline: Map<string, string>;
+  /** True if the next poll should mark events as latest (initial state) */
+  includeLatest: boolean;
+  /** True if we've already sent the initial latest events */
+  initialLatestSent: boolean;
   server?: Bun.Server<SocketData>;
 };
 
 type SocketData = {
   id: string;
+  includeLatest: boolean;
 };
 
 export async function startDaemon(port = DEFAULT_PORT): Promise<Bun.Server<SocketData>> {
@@ -23,6 +28,8 @@ export async function startDaemon(port = DEFAULT_PORT): Promise<Bun.Server<Socke
     subscriptionsBySocket: new Map(),
     socketTargets: new Map(),
     lastStateByPipeline: new Map(),
+    includeLatest: false,
+    initialLatestSent: false,
   };
 
   const client = new CircleCiClient(() => state.token);
@@ -170,6 +177,7 @@ export async function startDaemon(port = DEFAULT_PORT): Promise<Bun.Server<Socke
       open(ws) {
         state.subscriptionsBySocket.set(ws.data.id, new Set());
         state.socketTargets.set(ws.data.id, []);
+        ws.data.includeLatest = false;
         ws.subscribe('events');
       },
       close(ws) {
@@ -179,7 +187,7 @@ export async function startDaemon(port = DEFAULT_PORT): Promise<Bun.Server<Socke
       },
       async message(ws, message) {
         const text = typeof message === 'string' ? message : Buffer.from(message).toString('utf8');
-        const payload = JSON.parse(text) as { type?: string; targets?: string[] };
+        const payload = JSON.parse(text) as { type?: string; targets?: string[]; includeLatest?: boolean };
         if (payload.type !== 'subscribe') {
           ws.send(JSON.stringify({ type: 'error', message: 'Unsupported message type' }));
           return;
@@ -189,6 +197,11 @@ export async function startDaemon(port = DEFAULT_PORT): Promise<Bun.Server<Socke
         const normalizedTargets = parsedTargets.map((target) => formatTarget(target));
         state.subscriptionsBySocket.set(ws.data.id, new Set(normalizedTargets));
         state.socketTargets.set(ws.data.id, parsedTargets);
+        ws.data.includeLatest = payload.includeLatest ?? false;
+        if (ws.data.includeLatest) {
+          state.includeLatest = true;
+          state.initialLatestSent = false;
+        }
         ensurePolling();
         sendSubscribedEvent(ws, normalizedTargets);
       },
@@ -220,16 +233,31 @@ function publishIfChanged(
 ): void {
   const key = `${snapshot.projectSlug}:${snapshot.number}`;
   const previous = state.lastStateByPipeline.get(key);
-  if (previous === snapshot.state) {
+
+  // Determine if this is a latest/initial event
+  const isLatest = state.includeLatest && !state.initialLatestSent;
+  if (isLatest) {
+    state.initialLatestSent = true;
+    state.includeLatest = false;
+  }
+
+  // Skip if state hasn't changed (unless this is a latest event)
+  if (previous === snapshot.state && !isLatest) {
     return;
   }
 
   state.lastStateByPipeline.set(key, snapshot.state);
+
+  const event = toStreamEvent(target, snapshot);
+  if (isLatest) {
+    event.isLatest = true;
+  }
+
   state.server?.publish(
     'events',
     JSON.stringify({
       type: 'event',
-      payload: toStreamEvent(target, snapshot),
+      payload: event,
     }),
   );
 }

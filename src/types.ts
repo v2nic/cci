@@ -82,4 +82,6 @@ export type StreamEvent = {
   description: string;
   circleCiUrl: string;
   target: string;
+  /** True if this is the latest/initial status (not a new update) */
+  isLatest?: boolean;
 };

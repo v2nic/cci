@@ -127,6 +127,8 @@ async function subscribe(args: string[]): Promise<number> {
     parseTarget(target);
   }
 
+  const includeLatest = args.includes('--include-latest');
+
   const socket = new WebSocket(`ws://${DEFAULT_HOST}:${DEFAULT_PORT}/ws`);
   const stream = new Promise<number>((resolve) => {
     socket.addEventListener('message', (event) => {
@@ -148,7 +150,7 @@ async function subscribe(args: string[]): Promise<number> {
     });
   });
 
-  socket.send(JSON.stringify({ type: 'subscribe', targets }));
+  socket.send(JSON.stringify({ type: 'subscribe', targets, includeLatest }));
 
   return await stream;
 }
