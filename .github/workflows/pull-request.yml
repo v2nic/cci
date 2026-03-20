@@ -8,7 +8,16 @@ permissions:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs-on: ubuntu-latest
+            target: bun-linux-x64
+          - runs-on: macos-13
+            target: bun-darwin-x64
+
+    runs-on: ${{ matrix.runs-on }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -22,10 +31,15 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Install Playwright browsers
-        run: bunx playwright install --with-deps chromium
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            bunx playwright install --with-deps chromium
+          else
+            bunx playwright install chromium
+          fi
 
       - name: Build the binary
-        run: bun run build
+        run: bun build --compile ./src/index.ts --outfile ./dist/cci --target=${{ matrix.target }}
 
       - name: Run the unit and integration tests
         run: bun test

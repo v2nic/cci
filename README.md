@@ -32,11 +32,23 @@ pipelines/github/<org>/<project>
 
 Download the latest release asset and install the binary:
 
+Linux:
+
 ```bash
-gh release download latest --repo v2nic/cci --pattern 'cci-linux-x64.tar.gz' --dir /tmp/cci
+gh release download latest --repo v2nic/cci --pattern 'cci-*.tar.gz' --dir /tmp/cci
 tar -xzf /tmp/cci/cci-linux-x64.tar.gz -C /tmp/cci
 install -m 0755 /tmp/cci/cci /usr/local/bin/cci
 ```
+
+macOS:
+
+```bash
+gh release download latest --repo v2nic/cci --pattern 'cci-*.tar.gz' --dir /tmp/cci
+tar -xzf /tmp/cci/cci-darwin-x64.tar.gz -C /tmp/cci
+install -m 0755 /tmp/cci/cci /usr/local/bin/cci
+```
+
+The release assets are published separately for Linux and macOS.
 
 To install a specific version, replace `latest` with a tag such as `v0.1.0`.
 
@@ -71,7 +83,7 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The GitHub Action in `.github/workflows/release.yml` builds `dist/cci`, packages it as `cci-linux-x64.tar.gz`, uploads the archive as an Actions artifact, and publishes it to the GitHub Release for the tag.
+The GitHub Action in `.github/workflows/release.yml` builds Linux and macOS binaries, packages them as release archives, uploads the archives as Actions artifacts, and publishes them to the GitHub Release for the tag.
 
 ## Usage
 
