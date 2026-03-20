@@ -20,7 +20,14 @@ The CircleCI webhook extension for pi has been implemented and installed to:
 ⚙️ CCI: main | ⟳ build-and-test (2m) | ⟳ deploy-staging (45s) | https://app.circleci.com/pipelines/...
 ```
 
-#### Status Icons
+#### Error States in Footer
+```
+⚙️ CCI: main | ⛔ cci CLI not found
+⚙️ CCI: main | ○ Not a CircleCI repo
+⚙️ CCI: main | ○ No git remote
+⚙️ CCI: main | ◌ Connecting...
+⚙️ CCI: main | ⛔ Connection failed
+```
 - `⟳` - Running
 - `✓` - Success
 - `✗` - Failed
@@ -45,8 +52,9 @@ On workflow completion (if enabled):
 4. **Parsing**: Reads JSON lines from stdout, parses workflow events
 5. **Rendering**: Updates footer with current workflows and pipeline URL
 6. **Tracking**: Polls for branch changes every 5 seconds
-7. **Restart**: Auto-restarts with exponential backoff on crash
+7. **Restart**: Auto-restarts with exponential backoff (2s, 4s, 8s, max 3 attempts) on crash
 8. **Cleanup**: Stops subscription and clears state on session shutdown
+9. **Error Handling**: Gracefully handles missing cci CLI, shows error state in footer instead of spamming logs
 
 ## Configuration
 
