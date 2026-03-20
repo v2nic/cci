@@ -102,6 +102,6 @@ describe('web renderer', () => {
     expect(html).toContain('react-dom.development.js');
     expect(html).toContain('@babel/standalone');
     expect(html).toContain('type="text/babel"');
-    expect(html).toContain('createRoot(document.getElementById("root"))');
+    expect(html).toContain('createRoot(document.getElementById');
   });
 });

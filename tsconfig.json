@@ -6,8 +6,15 @@
     "strict": true,
     "noEmit": true,
     "allowJs": false,
+    "jsx": "react-jsx",
     "types": ["bun", "node"],
     "skipLibCheck": true
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts", "playwright.config.ts"]
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "tests/**/*.ts",
+    "tests/**/*.tsx",
+    "playwright.config.ts"
+  ]
 }

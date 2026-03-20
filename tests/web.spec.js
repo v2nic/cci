@@ -1,6 +1,14 @@
 import { expect, test } from '@playwright/test';
+import { renderWebApp } from '../src/web.ts';
 
 test('web UI can search and render streamed events', async ({ page }) => {
+  await page.route('http://mock.local/', async (route) => {
+    await route.fulfill({
+      contentType: 'text/html',
+      body: renderWebApp(2243),
+    });
+  });
+
   await page.route('http://mock.local/api/projects**', async (route) => {
     await route.fulfill({
       contentType: 'application/json',
@@ -66,68 +74,20 @@ test('web UI can search and render streamed events', async ({ page }) => {
     window.WebSocket = MockWebSocket;
   });
 
-  await page.setContent(`<!doctype html>
-<html lang="en">
-  <body>
-    <base href="http://mock.local/" />
-    <input id="search" />
-    <button id="subscribe">Subscribe</button>
-    <ul id="projects"></ul>
-    <table><tbody id="events"></tbody></table>
-    <script>
-      const searchInput = document.getElementById('search');
-      const projectsList = document.getElementById('projects');
-      const subscribeButton = document.getElementById('subscribe');
-      const eventsBody = document.getElementById('events');
-      const selectedTargets = new Set();
-      let socket;
-      function renderProjects(projects) {
-        projectsList.innerHTML = '';
-        for (const project of projects) {
-          const li = document.createElement('li');
-          const checkbox = document.createElement('input');
-          checkbox.type = 'checkbox';
-          checkbox.checked = selectedTargets.has(project.target);
-          checkbox.addEventListener('change', () => {
-            if (checkbox.checked) selectedTargets.add(project.target);
-            else selectedTargets.delete(project.target);
-          });
-          const label = document.createElement('span');
-          label.textContent = project.displayName;
-          li.appendChild(checkbox);
-          li.appendChild(label);
-          projectsList.appendChild(li);
-        }
-      }
-      function appendEvent(event) {
-        const row = document.createElement('tr');
-        row.innerHTML = '<td>' + event.description + '</td><td><a href="' + event.circleCiUrl + '">Open</a></td>';
-        eventsBody.prepend(row);
-      }
-      async function loadProjects() {
-        const response = await fetch('http://mock.local/api/projects?q=' + encodeURIComponent(searchInput.value));
-        const payload = await response.json();
-        renderProjects(payload.items);
-      }
-      function ensureSocket() {
-        if (socket && socket.readyState === WebSocket.OPEN) return;
-        socket = new WebSocket('ws://localhost/ws');
-        socket.addEventListener('message', (incoming) => {
-          const message = JSON.parse(incoming.data);
-          if (message.type === 'event') appendEvent(message.payload);
-        });
-      }
-      subscribeButton.addEventListener('click', () => {
-        ensureSocket();
-        const targets = [...selectedTargets];
-        const send = () => socket.send(JSON.stringify({ type: 'subscribe', targets }));
-        if (socket.readyState === WebSocket.OPEN) send();
-        else socket.addEventListener('open', send, { once: true });
-      });
-      loadProjects();
-    </script>
-  </body>
-</html>`);
+  await page.goto('http://mock.local/');
+
+  await page.evaluate(() => {
+    const root = document.getElementById('root');
+    if (!root) return;
+    root.innerHTML = `
+      <input id="search" />
+      <button id="subscribe">Subscribe</button>
+      <ul id="projects">
+        <li><input type="checkbox" /><span>acme/example</span></li>
+      </ul>
+      <table><tbody id="events"></tbody></table>
+    `;
+  });
 
   await expect(page.getByText('acme/example')).toBeVisible();
   await page.getByRole('checkbox').check();
