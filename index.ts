@@ -446,8 +446,26 @@ export default function (pi: ExtensionAPI) {
         invalidate() {},
         render(width: number): string[] {
           // CCI status line - fill the full width
-          const cciLine = theme.fg("dim", buildCciStatus());
-          const padding = " ".repeat(Math.max(0, width - [...cciLine].filter(c => !c.startsWith('\x1b')).length));
+          const statusText = buildCciStatus();
+          const cciLine = theme.fg("dim", statusText);
+
+          // Calculate visible width (excluding ANSI codes)
+          let visibleLen = 0;
+          let i = 0;
+          while (i < cciLine.length) {
+            if (cciLine[i] === '\x1b') {
+              // Skip ANSI escape sequence
+              while (i < cciLine.length && cciLine[i] !== 'm') {
+                i++;
+              }
+              i++; // Skip the final 'm'
+            } else {
+              visibleLen++;
+              i++;
+            }
+          }
+
+          const padding = " ".repeat(Math.max(0, width - visibleLen));
           const fullLine = cciLine + theme.fg("dim", padding);
           return [fullLine];
         },
