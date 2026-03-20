@@ -9,7 +9,6 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { spawn, type ChildProcess } from "node:child_process";
 import { access } from "node:fs/promises";
-import { join } from "node:path";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
 
@@ -96,74 +95,15 @@ export default function (pi: ExtensionAPI) {
   // Maximum restart attempts before giving up
   const MAX_RESTART_ATTEMPTS = 3;
 
-  // Status key for setStatus
-  const STATUS_KEY = "cci";
-
-  // Load configuration from settings
+  // Load configuration
   function loadConfig(): CciConfig {
-    try {
-      const settingsPath = join(process.env.HOME || "", ".pi", "agent", "settings.json");
-      return DEFAULT_CONFIG;
-    } catch {
-      return DEFAULT_CONFIG;
-    }
+    return DEFAULT_CONFIG;
   }
-
-  // Update the status text in the footer
-  function updateStatus(): void {
-    const branch = currentBranch || "unknown";
-
-    let statusText: string;
-
-    // Handle different states
-    if (extensionState === "not_installed") {
-      statusText = `CCI: ${branch} | ⛔ cci CLI not found`;
-    } else if (extensionState === "not_circleci") {
-      statusText = `CCI: ${branch} | ○ Not a CircleCI repo`;
-    } else if (extensionState === "no_remote") {
-      statusText = `CCI: ${branch} | ○ No git remote`;
-    } else if (extensionState === "error") {
-      statusText = `CCI: ${branch} | ⛔ ${errorMessage}`;
-    } else if (extensionState === "checking" || isRestarting) {
-      statusText = `CCI: ${branch} | ◌ Connecting`;
-    } else if (extensionState === "subscribed") {
-      // Build workflow status
-      const workflowParts: string[] = [];
-      for (const wf of workflows.values()) {
-        const icon = STATUS_ICONS[wf.status] || "?";
-        if (wf.status === "running") {
-          const elapsed = formatDuration(wf.startedAt);
-          workflowParts.push(`${icon} ${wf.name} (${elapsed})`);
-        } else {
-          workflowParts.push(`${icon} ${wf.name}`);
-        }
-      }
-
-      if (workflowParts.length > 0) {
-        statusText = `CCI: ${branch} | ${workflowParts.join(" | ")}`;
-      } else if (currentPipelineUrl) {
-        statusText = `CCI: ${branch} | idle`;
-      } else {
-        statusText = `CCI: ${branch}`;
-      }
-    } else {
-      statusText = `CCI: ${branch}`;
-    }
-
-    pi.emit("status_update", statusText);
-  }
-
-  // Emit status update via the events system
-  pi.events.on("status_update" as any, (statusText: string) => {
-    // This won't work directly - we need to use ctx.ui.setStatus
-    // But we don't have ctx here, so we'll handle this differently
-  });
 
   // Check if .circleci/config.yml exists
   async function isCircleCIEnabled(cwd: string): Promise<boolean> {
     try {
-      const configPath = join(cwd, ".circleci", "config.yml");
-      await access(configPath);
+      await access(cwd + "/.circleci/config.yml");
       return true;
     } catch {
       return false;
@@ -176,16 +116,11 @@ export default function (pi: ExtensionAPI) {
       const { stdout } = await execAsync("git remote get-url origin", { cwd });
       const url = stdout.trim();
 
-      // Parse GitHub URL: git@github.com:org/project.git or https://github.com/org/project
       const gitMatch = url.match(/git@github\.com:(.+?)\/(.+?)(?:\.git)?$/);
       const httpsMatch = url.match(/https?:\/\/github\.com\/(.+?)\/(.+?)(?:\.git)?$/);
 
-      if (gitMatch) {
-        return { org: gitMatch[1], project: gitMatch[2] };
-      }
-      if (httpsMatch) {
-        return { org: httpsMatch[1], project: httpsMatch[2] };
-      }
+      if (gitMatch) return { org: gitMatch[1], project: gitMatch[2] };
+      if (httpsMatch) return { org: httpsMatch[1], project: httpsMatch[2] };
       return null;
     } catch {
       return null;
@@ -212,7 +147,7 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  // Parse workflow status to our type
+  // Parse workflow status
   function parseStatus(
     status: string
   ): "running" | "success" | "failed" | "canceled" | "queued" | "not_run" {
@@ -235,33 +170,63 @@ export default function (pi: ExtensionAPI) {
     return `${hours}h ${minutes % 60}m`;
   }
 
-  // Set extension state and update status
+  // Set extension state
   function setState(state: ExtensionState, message: string = ""): void {
     extensionState = state;
     errorMessage = message;
   }
 
+  // Build CCI status line for footer
+  function buildCciStatus(): string {
+    const branch = currentBranch || "unknown";
+
+    switch (extensionState) {
+      case "not_installed":
+        return `⚙️ CCI: ${branch} | ⛔ cci CLI not found`;
+      case "not_circleci":
+        return `⚙️ CCI: ${branch} | ○ Not a CircleCI repo`;
+      case "no_remote":
+        return `⚙️ CCI: ${branch} | ○ No git remote`;
+      case "error":
+        return `⚙️ CCI: ${branch} | ⛔ ${errorMessage}`;
+      case "checking":
+      case "idle":
+        return `⚙️ CCI: ${branch} | ◌ Checking...`;
+      case "subscribed":
+        if (workflows.size === 0) {
+          return `⚙️ CCI: ${branch} | idle`;
+        }
+        const parts: string[] = [];
+        for (const wf of workflows.values()) {
+          const icon = STATUS_ICONS[wf.status] || "?";
+          if (wf.status === "running") {
+            parts.push(`${icon} ${wf.name} (${formatDuration(wf.startedAt)})`);
+          } else {
+            parts.push(`${icon} ${wf.name}`);
+          }
+        }
+        return `⚙️ CCI: ${branch} | ${parts.join(" | ")}`;
+      default:
+        return `⚙️ CCI: ${branch}`;
+    }
+  }
+
   // Start cci subscribe process
   async function startSubscription(cwd: string): Promise<void> {
-    // Stop any existing subscription
     stopSubscription();
-
     setState("checking");
 
-    // Check if CircleCI is enabled
     if (!(await isCircleCIEnabled(cwd))) {
       setState("not_circleci");
       return;
     }
 
-    // Get git remote
     const remote = await getGitRemote(cwd);
     if (!remote) {
       setState("no_remote");
       return;
     }
 
-    // Check if cci CLI is available
     if (!(await isCciAvailable())) {
       setState("not_installed");
       return;
@@ -271,7 +236,6 @@ export default function (pi: ExtensionAPI) {
     currentProject = remote.project;
     currentPipelineUrl = `https://app.circleci.com/pipelines/${remote.org}/${remote.project}`;
 
-    // Get branch
     currentBranch = await getGitBranch(cwd);
     if (!currentBranch || currentBranch === "(detached)") {
       setState("error", "Detached HEAD");
@@ -280,7 +244,6 @@ export default function (pi: ExtensionAPI) {
 
     setState("checking");
 
-    // Spawn cci subscribe process
     const subscribeTarget = `pipelines/github/${currentOrg}/${currentProject}`;
     try {
       cciProcess = spawn(cciPath, ["subscribe", subscribeTarget], {
@@ -315,23 +278,20 @@ export default function (pi: ExtensionAPI) {
         try {
           const event = JSON.parse(line) as CciWorkflowEvent;
           handleWorkflowEvent(event);
-        } catch (e) {
-          // Ignore parse errors for non-JSON output
+        } catch {
+          // Ignore parse errors
         }
       }
     });
 
-    // Only log stderr at debug level, don't spam the session
-    cciProcess.stderr.on("data", (data: Buffer) => {
-      // Silently ignore stderr to avoid polluting the session
-    });
+    // Silently ignore stderr
+    cciProcess.stderr.on("data", () => {});
 
     cciProcess.on("error", (err: Error) => {
       if (err.message.includes("ENOENT")) {
         setState("not_installed");
         return;
       }
-      // Log error once, then schedule restart
       if (restartAttempts === 0) {
         setState("error", "Connection failed");
       }
@@ -339,11 +299,9 @@ export default function (pi: ExtensionAPI) {
     });
 
     cciProcess.on("exit", (code: number | null) => {
-      if (extensionState === "not_installed" || extensionState === "not_circleci" || extensionState === "no_remote") {
-        // Terminal states - don't restart
+      if (["not_installed", "not_circleci", "no_remote"].includes(extensionState)) {
         return;
       }
-
       if (code !== 0 && code !== null && !isRestarting) {
         scheduleRestart(cwd);
       }
@@ -353,27 +311,23 @@ export default function (pi: ExtensionAPI) {
     setState("subscribed");
   }
 
-  // Stop cci subscribe process
+  // Stop subscription
   function stopSubscription(): void {
     isRestarting = false;
-
     if (restartTimeout) {
       clearTimeout(restartTimeout);
       restartTimeout = null;
     }
-
     if (cciProcess) {
       cciProcess.kill("SIGTERM");
       cciProcess = null;
     }
-
     workflows.clear();
   }
 
-  // Schedule restart with exponential backoff
+  // Schedule restart with backoff
   function scheduleRestart(cwd: string): void {
-    // Don't restart if in a terminal error state
-    if (extensionState === "not_installed" || extensionState === "not_circleci" || extensionState === "no_remote") {
+    if (["not_installed", "not_circleci", "no_remote"].includes(extensionState)) {
       return;
     }
 
@@ -384,8 +338,6 @@ export default function (pi: ExtensionAPI) {
     }
 
     isRestarting = true;
-
-    // Exponential backoff: 2s, 4s, 8s
     const delay = 1000 * Math.pow(2, restartAttempts);
     restartAttempts++;
 
@@ -410,50 +362,37 @@ export default function (pi: ExtensionAPI) {
 
       if (notifications.workflowStarted) {
         pi.sendMessage(
-          {
-            customType: "cci-notification",
-            content: `🔄 Workflow started: **${workflow.name}**`,
-            display: true,
-          },
+          { customType: "cci-notification", content: `🔄 Workflow **${workflow.name}** started`, display: true },
           { deliverAs: "steer", triggerTurn: false }
         );
       }
     } else if (type === "workflow-completed") {
       const status = parseStatus(workflow.status);
       const existing = workflows.get(workflow.id);
-
       if (existing) {
         existing.status = status;
       }
 
       if (notifications.workflowCompleted && status === "success") {
         pi.sendMessage(
-          {
-            customType: "cci-notification",
-            content: `✅ Workflow **${workflow.name}** passed`,
-            display: true,
-          },
+          { customType: "cci-notification", content: `✅ Workflow **${workflow.name}** passed`, display: true },
           { deliverAs: "steer", triggerTurn: false }
         );
       } else if (notifications.workflowFailed && (status === "failed" || status === "canceled")) {
         pi.sendMessage(
-          {
-            customType: "cci-notification",
-            content: `❌ Workflow **${workflow.name}** ${status === "failed" ? "failed" : "was canceled"}`,
-            display: true,
-          },
+          { customType: "cci-notification", content: `❌ Workflow **${workflow.name}** ${status === "failed" ? "failed" : "canceled"}`, display: true },
           { deliverAs: "steer", triggerTurn: false }
         );
       }
 
-      // Remove from active workflows after a delay
+      // Remove after delay
       setTimeout(() => {
         workflows.delete(workflow.id);
       }, 60000);
     }
   }
 
-  // Check if we're still in a git repo
+  // Check if still in git repo
   async function isInGitRepo(cwd: string): Promise<boolean> {
     try {
       await execAsync("git rev-parse --git-dir", { cwd });
@@ -466,90 +405,59 @@ export default function (pi: ExtensionAPI) {
   // Track branch changes
   let lastCheckedBranch: string | null = null;
   let branchCheckInterval: ReturnType<typeof setInterval> | null = null;
-  let currentCtx: { cwd: string; ui: ExtensionAPI } | null = null;
+  let currentCtx: { cwd: string; ui: ExtensionAPI["ui"] } | null = null;
+  let tuiRef: { requestRender: () => void } | null = null;
 
   async function checkBranchChange(): Promise<void> {
     if (!currentCtx) return;
-    const { cwd } = currentCtx;
 
-    if (!(await isInGitRepo(cwd))) {
+    if (!(await isInGitRepo(currentCtx.cwd))) {
       stopSubscription();
       setState("idle");
       return;
     }
 
-    const currentBranchNow = await getGitBranch(cwd);
+    const currentBranchNow = await getGitBranch(currentCtx.cwd);
     if (currentBranchNow && currentBranchNow !== lastCheckedBranch && lastCheckedBranch !== null) {
-      await startSubscription(cwd);
+      await startSubscription(currentCtx.cwd);
     }
     lastCheckedBranch = currentBranchNow;
   }
 
-  // Build status text for display
-  function buildStatusText(): string {
-    const branch = currentBranch || "unknown";
-
-    // Handle different states
-    if (extensionState === "not_installed") {
-      return `CCI: ${branch} | ⛔ cci CLI not found`;
-    }
-
-    if (extensionState === "not_circleci") {
-      return `CCI: ${branch} | ○ Not a CircleCI repo`;
-    }
-
-    if (extensionState === "no_remote") {
-      return `CCI: ${branch} | ○ No git remote`;
-    }
-
-    if (extensionState === "error") {
-      return `CCI: ${branch} | ⛔ ${errorMessage}`;
-    }
-
-    if (extensionState === "checking" || isRestarting) {
-      return `CCI: ${branch} | ◌ Connecting`;
-    }
-
-    // Normal subscribed state
-    const workflowParts: string[] = [];
-    for (const wf of workflows.values()) {
-      const icon = STATUS_ICONS[wf.status] || "?";
-      if (wf.status === "running") {
-        workflowParts.push(`${icon} ${wf.name} (${formatDuration(wf.startedAt)})`);
-      } else {
-        workflowParts.push(`${icon} ${wf.name}`);
-      }
-    }
-
-    if (workflowParts.length > 0) {
-      return `CCI: ${branch} | ${workflowParts.join(" | ")}`;
-    } else if (currentPipelineUrl) {
-      return `CCI: ${branch} | idle`;
-    } else {
-      return `CCI: ${branch}`;
-    }
-  }
-
-  // Initialize on session start
+  // Initialize
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
 
-    // Check if cci CLI is available first
     const available = await isCciAvailable();
     if (!available) {
       setState("not_installed");
     }
 
-    // Start subscription
     await startSubscription(ctx.cwd);
 
-    // Set up status update using setStatus (additive, not replacing footer)
-    ctx.ui.setStatus(STATUS_KEY, buildStatusText());
+    // Set up custom footer
+    ctx.ui.setFooter((tui, theme) => {
+      tuiRef = tui;
 
-    // Start polling for branch changes and updating status
+      return {
+        dispose() {
+          tuiRef = null;
+        },
+        invalidate() {},
+        render(width: number): string[] {
+          // CCI status line - fill the full width
+          const cciLine = theme.fg("dim", buildCciStatus());
+          const padding = " ".repeat(Math.max(0, width - [...cciLine].filter(c => !c.startsWith('\x1b')).length));
+          const fullLine = cciLine + theme.fg("dim", padding);
+          return [fullLine];
+        },
+      };
+    });
+
+    // Start polling for branch changes
     branchCheckInterval = setInterval(async () => {
       await checkBranchChange();
-      ctx.ui.setStatus(STATUS_KEY, buildStatusText());
+      tuiRef?.requestRender();
     }, 5000);
   });
 
@@ -559,26 +467,25 @@ export default function (pi: ExtensionAPI) {
       clearInterval(branchCheckInterval);
       branchCheckInterval = null;
     }
-
     stopSubscription();
-    currentCtx?.ui.setStatus(STATUS_KEY, undefined);
+    currentCtx = null;
   });
 
-  // Register command to manually trigger subscription
+  // Register command to restart subscription
   pi.registerCommand("cci-subscribe", {
     description: "Restart CircleCI subscription for current branch",
     handler: async (_args, ctx) => {
       await startSubscription(ctx.cwd);
-      ctx.ui.setStatus(STATUS_KEY, buildStatusText());
+      tuiRef?.requestRender();
     },
   });
 
-  // Register command to show current status
+  // Register command to show status
   pi.registerCommand("cci-status", {
     description: "Show CircleCI workflow status",
     handler: async (_args, ctx) => {
-      const statusText = buildStatusText();
-      ctx.ui.notify(statusText, "info");
+      const status = buildCciStatus();
+      ctx.ui.notify(status, "info");
     },
   });
 }
