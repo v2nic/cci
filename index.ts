@@ -436,8 +436,8 @@ export default function (pi: ExtensionAPI) {
 
     await startSubscription(ctx.cwd);
 
-    // Set up custom footer with CCI status and token stats
-    ctx.ui.setFooter((tui, theme) => {
+    // Set up custom footer that replicates default footer + adds CCI on new line at end
+    ctx.ui.setFooter((tui, theme, footerData) => {
       tuiRef = tui;
 
       return {
@@ -446,7 +446,19 @@ export default function (pi: ExtensionAPI) {
         },
         invalidate() {},
         render(width: number): string[] {
-          // Calculate token stats from session (same as default footer)
+          // Line 1: PWD + branch + session name
+          let pwd = process.cwd();
+          const home = process.env.HOME || process.env.USERPROFILE;
+          if (home && pwd.startsWith(home)) {
+            pwd = `~${pwd.slice(home.length)}`;
+          }
+
+          const branch = footerData.getGitBranch();
+          if (branch) {
+            pwd = `${pwd} • ${branch}`;
+          }
+
+          // Line 2: Token stats + model info
           let input = 0, output = 0, cost = 0;
           for (const e of ctx.sessionManager.getBranch()) {
             if (e.type === "message" && e.message.role === "assistant") {
@@ -460,18 +472,34 @@ export default function (pi: ExtensionAPI) {
           const fmt = (n: number) => n < 1000 ? `${n}` : n < 10000 ? `${(n/1000).toFixed(1)}k` : `${Math.round(n/1000)}k`;
           const costFmt = (n: number) => n < 1 ? `$${n.toFixed(3)}` : `$${n.toFixed(2)}`;
 
-          // Build lines - CCI status first, then token stats
-          const cciLine = theme.fg("dim", buildCciStatus());
-
-          // Token stats line
           const modelId = ctx.model?.id || "no-model";
           let statsParts = [];
           if (input) statsParts.push(`↑${fmt(input)}`);
           if (output) statsParts.push(`↓${fmt(output)}`);
           if (cost > 0) statsParts.push(costFmt(cost));
-          const statsLine = theme.fg("dim", `${statsParts.join(" ")} ${modelId}`);
+          const statsLine = `${statsParts.join(" ")} ${modelId}`;
 
-          return [cciLine, statsLine];
+          // Line 3: Other extension statuses (excluding our CCI status)
+          const extensionStatuses = footerData.getExtensionStatuses();
+          const otherStatuses = Array.from(extensionStatuses.entries())
+            .filter(([key]) => key !== "cci")
+            .map(([, text]) => text.replace(/[\r\n]/g, " ").trim())
+            .filter(Boolean);
+
+          // Build result - CCI goes LAST, on its own line
+          const lines: string[] = [
+            theme.fg("dim", pwd),
+            theme.fg("dim", statsLine),
+          ];
+
+          if (otherStatuses.length > 0) {
+            lines.push(theme.fg("dim", otherStatuses.join(" ")));
+          }
+
+          // CCI status on its own line at the end
+          lines.push(theme.fg("dim", buildCciStatus()));
+
+          return lines;
         },
       };
     });
