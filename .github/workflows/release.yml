@@ -1,0 +1,45 @@
+name: Build and Release cci
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build the binary
+        run: bun run build
+
+      - name: Package the binary
+        run: |
+          chmod +x dist/cci
+          tar -czf dist/cci-linux-x64.tar.gz -C dist cci
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cci-linux-x64
+          path: dist/cci-linux-x64.tar.gz
+
+      - name: Publish GitHub release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/cci-linux-x64.tar.gz
