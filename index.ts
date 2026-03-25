@@ -15,7 +15,7 @@ import { promisify } from "node:util";
 
 const execAsync = promisify(exec);
 
-// Types for CircleCI subscription events
+// Types for CircleCI subscription events (raw CircleCI events)
 interface CciWorkflowEvent {
   type: "workflow-completed" | "workflow-started" | "job-completed" | "job-started";
   timestamp: number;
@@ -37,6 +37,21 @@ interface CciWorkflowEvent {
   };
 }
 
+// Types for daemon stream events
+interface StreamEvent {
+  id: string;
+  timestamp: string;
+  project: string;
+  pipelineNumber: number;
+  eventType: string;
+  icon: string;
+  description: string;
+  circleCiUrl: string;
+  target: string;
+  /** True if this is the initial/latest status (not a new update) */
+  isLatest?: boolean;
+}
+
 // Parsed workflow for display
 interface Workflow {
   id: string;
@@ -44,7 +59,12 @@ interface Workflow {
   status: "running" | "success" | "failed" | "canceled" | "queued" | "not_run";
   startedAt: Date;
   pipelineUrl: string;
+  pipelineNumber: number;
+  branch: string;
 }
+
+// Cache for pipeline branch lookups (pipelineNumber -> branch)
+const pipelineBranchCache = new Map<number, string>();
 
 // Configuration
 interface CciConfig {
@@ -83,6 +103,7 @@ export default function (pi: ExtensionAPI) {
   let currentOrg: string | null = null;
   let currentProject: string | null = null;
   let currentPipelineUrl: string | null = null;
+  let lastPipeline: { status: string; startedAt: Date; pipelineNumber: number; branch: string } | null = null;
   let restartTimeout: ReturnType<typeof setTimeout> | null = null;
   let restartAttempts = 0;
   let extensionState: ExtensionState = "idle";
@@ -138,6 +159,52 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  // Get the branch name for a specific pipeline number (with caching)
+  async function getPipelineBranch(org: string, project: string, pipelineNumber: number): Promise<string | null> {
+    // Check cache first
+    if (pipelineBranchCache.has(pipelineNumber)) {
+      return pipelineBranchCache.get(pipelineNumber)!;
+    }
+
+    try {
+      const token = process.env.CIRCLECI_TOKEN || process.env.CIRCLE_TOKEN;
+      if (!token) {
+        console.error("[cci] No CircleCI token found");
+        return null;
+      }
+
+      const url = `https://circleci.com/api/v2/project/gh/${org}/${project}/pipeline/${pipelineNumber}`;
+      const response = await fetch(url, {
+        headers: {
+          "Circle-Token": token,
+          "Accept": "application/json",
+        },
+      });
+
+      if (!response.ok) {
+        console.error(`[cci] Failed to fetch pipeline ${pipelineNumber}: ${response.status}`);
+        return null;
+      }
+
+      const data = await response.json() as { vcs?: { branch?: string } };
+      const branch = data?.vcs?.branch || null;
+      
+      if (branch) {
+        // Cache the result (limit cache size)
+        if (pipelineBranchCache.size > 100) {
+          const firstKey = pipelineBranchCache.keys().next().value;
+          if (firstKey !== undefined) pipelineBranchCache.delete(firstKey);
+        }
+        pipelineBranchCache.set(pipelineNumber, branch);
+      }
+      
+      return branch;
+    } catch (err) {
+      console.error(`[cci] Error fetching pipeline ${pipelineNumber}:`, err);
+      return null;
+    }
+  }
+
   // Check if cci CLI is available
   async function isCciAvailable(): Promise<boolean> {
     try {
@@ -171,6 +238,18 @@ export default function (pi: ExtensionAPI) {
     return `${hours}h ${minutes % 60}m`;
   }
 
+  // Format relative time
+  function formatRelativeTime(date: Date): string {
+    const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
+    if (seconds < 60) return `${seconds}s ago`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.floor(hours / 24);
+    return `${days}d ago`;
+  }
+
   // Set extension state
   function setState(state: ExtensionState, message: string = ""): void {
     extensionState = state;
@@ -194,19 +273,25 @@ export default function (pi: ExtensionAPI) {
       case "idle":
         return `⚙️ CCI: ${branch} | ◌ Checking`;
       case "subscribed":
-        if (workflows.size === 0) {
-          return `⚙️ CCI: ${branch} | idle`;
-        }
-        const parts: string[] = [];
-        for (const wf of workflows.values()) {
-          const icon = STATUS_ICONS[wf.status] || "?";
-          if (wf.status === "running") {
-            parts.push(`${icon} ${wf.name} (${formatDuration(wf.startedAt)})`);
-          } else {
-            parts.push(`${icon} ${wf.name}`);
+        if (workflows.size > 0) {
+          const parts: string[] = [];
+          for (const wf of workflows.values()) {
+            const icon = STATUS_ICONS[wf.status] || "?";
+            if (wf.status === "running") {
+              parts.push(`${icon} ${wf.name} (${formatDuration(wf.startedAt)})`);
+            } else {
+              parts.push(`${icon} ${wf.name} (${formatRelativeTime(wf.startedAt)})`);
+            }
           }
+          return `⚙️ CCI: ${branch} | ${parts.join(" | ")}`;
         }
-        return `⚙️ CCI: ${branch} | ${parts.join(" | ")}`;
+        // Show last pipeline status if available
+        if (lastPipeline) {
+          const icon = STATUS_ICONS[lastPipeline.status] || "?";
+          const timeAgo = formatRelativeTime(lastPipeline.startedAt);
+          return `⚙️ CCI: ${branch} | ${icon} last: ${timeAgo}`;
+        }
+        return `⚙️ CCI: ${branch} | idle`;
       default:
         return `⚙️ CCI: ${branch}`;
     }
@@ -235,7 +320,7 @@ export default function (pi: ExtensionAPI) {
 
     currentOrg = remote.org;
     currentProject = remote.project;
-    currentPipelineUrl = `https://app.circleci.com/pipelines/${remote.org}/${remote.project}`;
+    currentPipelineUrl = `https://app.circleci.com/pipelines/github/${remote.org}/${remote.project}?branch=${encodeURIComponent(currentBranch || "")}`;
 
     currentBranch = await getGitBranch(cwd);
     if (!currentBranch || currentBranch === "(detached)") {
@@ -243,11 +328,17 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    // Update pipeline URL with correct branch
+    currentPipelineUrl = `https://app.circleci.com/pipelines/github/${remote.org}/${remote.project}?branch=${encodeURIComponent(currentBranch)}`;
+
+    console.log(`[cci] Subscribing to pipelines for branch ${currentBranch}`);
+
     setState("checking");
 
     const subscribeTarget = `pipelines/github/${currentOrg}/${currentProject}`;
     try {
-      cciProcess = spawn(cciPath, ["subscribe", subscribeTarget], {
+      // Use --include-latest to get current status on subscribe
+      cciProcess = spawn(cciPath, ["subscribe", subscribeTarget, "--include-latest"], {
         cwd,
         stdio: ["ignore", "pipe", "pipe"],
         env: { ...process.env },
@@ -277,8 +368,13 @@ export default function (pi: ExtensionAPI) {
       for (const line of lines) {
         if (!line.trim()) continue;
         try {
-          const event = JSON.parse(line) as CciWorkflowEvent;
-          handleWorkflowEvent(event);
+          const parsed = JSON.parse(line);
+          // Check if it's a daemon stream event (has eventType) or raw CircleCI event (has type)
+          if ("eventType" in parsed) {
+            handleStreamEvent(parsed as StreamEvent);
+          } else if ("type" in parsed) {
+            handleWorkflowEvent(parsed as CciWorkflowEvent);
+          }
         } catch {
           // Ignore parse errors
         }
@@ -347,9 +443,27 @@ export default function (pi: ExtensionAPI) {
     }, delay);
   }
 
+  // Check if pipeline branch matches current branch (async with caching)
+  async function checkPipelineBranch(pipelineNumber: number): Promise<boolean> {
+    // Get branch from cache or API
+    let branch = pipelineBranchCache.get(pipelineNumber);
+    
+    if (!branch && currentOrg && currentProject) {
+      branch = await getPipelineBranch(currentOrg, currentProject, pipelineNumber);
+    }
+    
+    if (!branch) return true; // If we can't determine branch, show notification to be safe
+    
+    // Check if the branch matches our current branch (normalize for comparison)
+    const normalizedEventBranch = branch.replace(/^refs\/heads\//, '').toLowerCase();
+    const normalizedCurrentBranch = (currentBranch || '').replace(/^refs\/heads\//, '').toLowerCase();
+    
+    return normalizedEventBranch === normalizedCurrentBranch;
+  }
+
   // Handle workflow events
   function handleWorkflowEvent(event: CciWorkflowEvent): void {
-    const { type, workflow, pipeline } = event;
+    const { type, workflow, pipeline, isLatest } = event;
 
     if (type === "workflow-started") {
       const wf: Workflow = {
@@ -358,14 +472,23 @@ export default function (pi: ExtensionAPI) {
         status: parseStatus(workflow.status),
         startedAt: new Date(workflow.started_at || Date.now()),
         pipelineUrl: `https://app.circleci.com/pipelines/${pipeline.project_slug}/${pipeline.number}`,
+        pipelineNumber: pipeline.number,
+        branch: pipelineBranchCache.get(pipeline.number) || "",
       };
       workflows.set(workflow.id, wf);
 
-      if (notifications.workflowStarted) {
-        pi.sendMessage(
-          { customType: "cci-notification", content: `🔄 Workflow **${workflow.name}** started`, display: true },
-          { deliverAs: "steer", triggerTurn: false }
-        );
+      // Only steer on real updates, not initial/latest status
+      // Branch check is done async, but we add to workflows for display regardless
+      if (!isLatest && notifications.workflowStarted) {
+        // Check branch asynchronously
+        checkPipelineBranch(pipeline.number).then(matches => {
+          if (matches) {
+            pi.sendMessage(
+              { customType: "cci-notification", content: `🔄 Workflow **${workflow.name}** started`, display: true },
+              { deliverAs: "steer", triggerTurn: false }
+            );
+          }
+        });
       }
     } else if (type === "workflow-completed") {
       const status = parseStatus(workflow.status);
@@ -374,22 +497,73 @@ export default function (pi: ExtensionAPI) {
         existing.status = status;
       }
 
-      if (notifications.workflowCompleted && status === "success") {
-        pi.sendMessage(
-          { customType: "cci-notification", content: `✅ Workflow **${workflow.name}** passed`, display: true },
-          { deliverAs: "steer", triggerTurn: false }
-        );
-      } else if (notifications.workflowFailed && (status === "failed" || status === "canceled")) {
-        pi.sendMessage(
-          { customType: "cci-notification", content: `❌ Workflow **${workflow.name}** ${status === "failed" ? "failed" : "canceled"}`, display: true },
-          { deliverAs: "steer", triggerTurn: false }
-        );
+      // Only steer on real updates, not initial/latest status
+      if (!isLatest) {
+        if (notifications.workflowCompleted && status === "success") {
+          checkPipelineBranch(pipeline.number).then(matches => {
+            if (matches) {
+              pi.sendMessage(
+                { customType: "cci-notification", content: `✅ Workflow **${workflow.name}** passed`, display: true },
+                { deliverAs: "steer", triggerTurn: false }
+              );
+            }
+          });
+        } else if (notifications.workflowFailed && (status === "failed" || status === "canceled")) {
+          checkPipelineBranch(pipeline.number).then(matches => {
+            if (matches) {
+              pi.sendMessage(
+                { customType: "cci-notification", content: `❌ Workflow **${workflow.name}** ${status === "failed" ? "failed" : "canceled"}`, display: true },
+                { deliverAs: "steer", triggerTurn: false }
+              );
+            }
+          });
+        }
       }
 
-      // Remove after delay
-      setTimeout(() => {
-        workflows.delete(workflow.id);
-      }, 60000);
+      // Remove completed workflows after delay (only for real updates)
+      if (!isLatest) {
+        setTimeout(() => {
+          workflows.delete(workflow.id);
+        }, 60000);
+      }
+    }
+  }
+
+  // Handle daemon stream events (pipeline-level status updates)
+  function handleStreamEvent(event: StreamEvent): void {
+    const { eventType, timestamp, circleCiUrl, isLatest, pipelineNumber } = event;
+
+    if (!pipelineNumber) return; // Skip events without pipeline number
+
+    // Build URL with pipeline number if not present in circleCiUrl
+    const pipelineUrl = `https://app.circleci.com/pipelines/github/${currentOrg}/${currentProject}/${pipelineNumber}`;
+
+    // Update last pipeline status (branch will be added async)
+    lastPipeline = {
+      status: eventType,
+      startedAt: new Date(timestamp),
+      pipelineNumber,
+      branch: pipelineBranchCache.get(pipelineNumber) || "",
+    };
+
+    // Only steer on real updates, not initial/latest status
+    if (!isLatest) {
+      // Check branch asynchronously
+      checkPipelineBranch(pipelineNumber).then(matches => {
+        if (!matches) return; // Skip if branch doesn't match
+
+        if (eventType === "success" && notifications.workflowCompleted) {
+          pi.sendMessage(
+            { customType: "cci-notification", content: `✅ Pipeline **passed** ${pipelineUrl}`, display: true },
+            { deliverAs: "steer", triggerTurn: false }
+          );
+        } else if ((eventType === "failed" || eventType === "error" || eventType === "canceled") && notifications.workflowFailed) {
+          pi.sendMessage(
+            { customType: "cci-notification", content: `❌ Pipeline **${eventType}** ${pipelineUrl}`, display: true },
+            { deliverAs: "steer", triggerTurn: false }
+          );
+        }
+      });
     }
   }
 
