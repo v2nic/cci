@@ -1,0 +1,48 @@
+name: Pull Request Checks
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs-on: ubuntu-latest
+            target: bun-linux-x64
+          - runs-on: macos-13
+            target: bun-darwin-x64
+
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Install Playwright browsers
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            bunx playwright install --with-deps chromium
+          else
+            bunx playwright install chromium
+          fi
+
+      - name: Build the binary
+        run: bun build --compile ./src/index.ts --outfile ./dist/cci --target=${{ matrix.target }}
+
+      - name: Run the unit and integration tests
+        run: bun test
+
+      - name: Run the browser test
+        run: bun run test:playwright
